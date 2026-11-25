@@ -39,8 +39,16 @@ ark-bn254 = { version = "0.6.0", default-features = false, features = ["curve", 
 ark-ff = { version = "0.6.0", default-features = false, features = ["std"] }
 ark-ec = { version = "0.6.0", default-features = false, features = ["std"] }
 
+# Issue #683 — Criterion suites executed by .github/workflows/bench.yml.
+# Auto-discovered bench targets use the libtest harness, which never calls
+# `criterion_main!`, so montgomery_ops would be silently skipped by
+# `cargo bench`; declaring it here with `harness = false` makes it run.
 [[bench]]
 name = "g1_ops"
+harness = false
+
+[[bench]]
+name = "montgomery_ops"
 harness = false
 
 # Issue #449 — gas profiling: Bulletproofs vs Groth16.
