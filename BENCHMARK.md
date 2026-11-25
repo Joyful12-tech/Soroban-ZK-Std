@@ -67,8 +67,76 @@ The pairing-only cost is verified by CI assertion (`cost <= 400_000_000`).
 
 ## CI Integration
 
-The benchmark suite runs via `cargo test -p zk-soroban -- --nocapture`
+The instruction-budget suite runs via
+`cargo test --release -p soroban-zk-std --bench instruction_cost -- --nocapture`
 (or `make bench`):
 
 - All single-primitive asserts enforce `cost ≤ 100,000,000`.
 - `groth16_verify` asserts `cost ≤ 400,000,000`.
+
+## CI regression gate (`.github/workflows/bench.yml`)
+
+The Criterion suites (`g1_ops`, `montgomery_ops`, `bulletproofs_vs_groth16`) are
+executed on every push to `main` and on every pull request that touches
+`crates/**`:
+
+| Event | What happens |
+|---|---|
+| push to `main` | Runs the suites with `--save-baseline main`, uploads the
+`criterion-baseline` artifact and caches `target/criterion`. |
+| pull request | Restores the cached baseline, runs the same suites with
+`--baseline main`, and fails when a benchmark regressed by more than the
+threshold. |
+| `workflow_dispatch` | Manual compare run; set `store-baseline` to record a new
+reference or `threshold` to override the gate. |
+
+The job summary (and the step log) contains a Markdown table with the baseline
+mean, current mean, relative change, 95 % confidence interval and a status per
+benchmark.
+
+### Threshold
+
+The gate defaults to **10 %** and is configurable without touching the workflow:
+
+- repository variable `BENCH_THRESHOLD` — a fraction (`0.10`) or a percentage
+  (`10%`);
+- the `threshold` input of a manual `workflow_dispatch` run (takes precedence);
+- `BENCH_MIN_MEAN_NS` (repository variable) — ignore benchmarks whose current
+  mean is faster than this many nanoseconds, for suites where sub-microsecond
+  timings are pure noise.
+
+### Noise handling
+
+The comparison only fails when the measured change exceeds the threshold **and**
+the 95 % confidence interval of the change excludes zero. Benchmarks above the
+threshold with an interval that still contains zero are reported as `noisy` in
+the summary but do not fail the job. The runner image is pinned to
+`ubuntu-24.04`, the Rust toolchain to `1.100.0`, and every suite runs with
+`--sample-size 100 --measurement-time 10 --warm-up-time 3`, so a single noisy
+sample cannot trip the gate. If a run is flagged as noisy, re-run the job before
+suspecting a regression.
+
+### Re-baselining
+
+Baselines are only valid on the same runner image and toolchain. Re-baseline
+after an intentional performance change, a rustc/runner upgrade, or a benchmark
+rename.
+
+1. Reproduce locally (same toolchain as CI, `rust-toolchain.toml`):
+
+   ```bash
+   cargo bench -p soroban-zk-core --all-features -- --save-baseline main
+   cargo bench -p soroban-zk-core --all-features -- --baseline main
+   ```
+
+2. Re-baseline in CI: run **Benchmark Regression → Run workflow** with
+   `store-baseline` enabled on the commit whose numbers should become the
+   reference (normally `main` after the intentional change is merged). That
+   overwrites the cache key that pull requests restore.
+3. Verify the next pull request restores the new baseline — the job log prints
+   `Comparing against the stored 'main' baseline.` and the summary is not the
+   "no comparison data" notice.
+
+Run `python3 scripts/bench-compare.py --self-test` to exercise the comparison
+logic (threshold parsing, boundary values, noise classification, missing
+baseline) without running the benchmarks.

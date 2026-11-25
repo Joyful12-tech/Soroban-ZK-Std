@@ -1,0 +1,204 @@
+name: Benchmark Regression
+
+# Issue #683 — the Criterion suites are useless unless something runs them.
+#
+#   main push  -> run every Criterion bench and store the results as the
+#                 `main` baseline (cache + artifact).
+#   pull request touching crates/** -> run the same benches, compare against the
+#                 stored baseline and fail on a regression larger than the
+#                 threshold (default 10 %) with a Markdown table in the job
+#                 summary.
+#
+# Noise control:
+#   * the runner image is pinned (`ubuntu-24.04`, never `*-latest`) — host CPU
+#     changes invalidate the baseline, so re-baseline after a runner upgrade;
+#   * each suite runs with 100 samples, a 10 s measurement window and a 3 s
+#     warm-up, which keeps run-to-run noise well below the gate;
+#   * a benchmark only fails when its point estimate exceeds the threshold AND
+#     the 95 % confidence interval excludes zero (see scripts/bench-compare.py).
+#
+# Re-baselining: see the "CI regression gate" section of BENCHMARK.md.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "crates/**"
+      - ".github/workflows/bench.yml"
+      - "scripts/bench-compare.py"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "crates/**"
+      - ".github/workflows/bench.yml"
+      - "scripts/bench-compare.py"
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'Regression threshold: fraction ("0.10") or percentage ("10%")'
+        required: false
+        default: ""
+        type: string
+      store-baseline:
+        description: "Store the results of this run as the new baseline"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Criterion baseline identifier written on main and read on pull requests.
+  BASELINE_NAME: main
+  # Ten seconds of measurement per sample plus 100 samples: the slowest suites
+  # (Bulletproofs prover) still finish, and the change estimate is stable.
+  CRITERION_ARGS: "--sample-size 100 --measurement-time 10 --warm-up-time 3 --noplot"
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # main: record the reference numbers
+  # ───────────────────────────────────────────────────────────────────────────
+  store-baseline:
+    name: 📊 Store main baseline
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.store-baseline)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Same compiler as `make ci-rust` (rust-toolchain.toml pins 1.100.0);
+      # a different rustc changes codegen and therefore the timings.
+      - name: Setup Pinned Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-bench-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bench-cargo-
+
+      - name: Run Criterion benches (save baseline)
+        run: |
+          cargo bench -p soroban-zk-core --all-features -- \
+            --save-baseline "$BASELINE_NAME" $CRITERION_ARGS
+
+      - name: Instruction budget assertions
+        run: cargo test --release -p soroban-zk-std --bench instruction_cost -- --nocapture
+
+      - name: Upload Criterion baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-baseline
+          path: target/criterion
+          retention-days: 30
+          if-no-files-found: error
+
+      # Keyed by run id so every main push supersedes the previous baseline.
+      # Pull requests restore the most recent key through the prefix below.
+      - name: Save Criterion baseline cache
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-v1-${{ runner.os }}-${{ github.run_id }}
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # pull requests: compare against the reference numbers
+  # ───────────────────────────────────────────────────────────────────────────
+  compare:
+    name: 📈 Compare against baseline
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Pinned Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-bench-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bench-cargo-
+
+      # Nothing is saved with this key: restoring only, so a PR run can never
+      # overwrite the baseline produced on main.
+      - name: Restore Criterion baseline
+        id: baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-v1-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            criterion-baseline-v1-${{ runner.os }}-
+
+      - name: Resolve regression threshold
+        id: gate
+        env:
+          DISPATCH_THRESHOLD: ${{ inputs.threshold }}
+          REPOSITORY_THRESHOLD: ${{ vars.BENCH_THRESHOLD }}
+        run: |
+          THRESHOLD="${DISPATCH_THRESHOLD:-${REPOSITORY_THRESHOLD:-0.10}}"
+          echo "value=$THRESHOLD" >> "$GITHUB_OUTPUT"
+          echo "Benchmark regression threshold: $THRESHOLD"
+
+      - name: Benchmark compare self-tests
+        run: python3 scripts/bench-compare.py --self-test
+
+      - name: Run Criterion benches (compare against baseline)
+        run: |
+          if [ -n "$(find target/criterion -type d -name "$BASELINE_NAME" -print -quit 2>/dev/null)" ]; then
+            echo "Comparing against the stored '$BASELINE_NAME' baseline."
+            cargo bench -p soroban-zk-core --all-features -- \
+              --baseline "$BASELINE_NAME" $CRITERION_ARGS
+          else
+            echo "::warning::No stored '$BASELINE_NAME' Criterion baseline was found; recording this run without a comparison."
+            cargo bench -p soroban-zk-core --all-features -- \
+              --save-baseline "$BASELINE_NAME" $CRITERION_ARGS
+          fi
+
+      - name: Instruction budget assertions
+        run: cargo test --release -p soroban-zk-std --bench instruction_cost -- --nocapture
+
+      - name: Compare against baseline
+        env:
+          THRESHOLD: ${{ steps.gate.outputs.value }}
+          BASELINE_FOUND: ${{ steps.baseline.outputs.cache-matched-key != '' }}
+          MIN_MEAN_NS: ${{ vars.BENCH_MIN_MEAN_NS }}
+        run: |
+          ARGS=(--criterion-dir target/criterion --threshold "$THRESHOLD")
+          if [ -n "${MIN_MEAN_NS:-}" ]; then
+            ARGS+=(--min-mean-ns "$MIN_MEAN_NS")
+          fi
+          if [ "$BASELINE_FOUND" = "true" ]; then
+            ARGS+=(--require-baseline)
+          else
+            echo "::warning::No Criterion baseline cache was restored — see BENCHMARK.md for re-baselining."
+          fi
+          python3 scripts/bench-compare.py "${ARGS[@]}"
