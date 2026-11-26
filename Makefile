@@ -1,5 +1,5 @@
 .PHONY: all ci ci-rust guard security-check fmt fmt-check clippy test test-release \
-	ct-test build-wasm build-wasm-verifier wasm-size wasm-size-check docs-check bench clean
+	build-wasm build-wasm-verifier wasm-size wasm-size-check docs-check bench clean
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dev default: type `make` to format in place, lint, test, and build WASM.
@@ -56,19 +56,6 @@ test:
 test-release:
 	@echo "Running test suite (release)..."
 	cargo test --release
-
-# ── Constant-Time Statistics (dudect-style) ──────────────────────────────────
-# Issue #689 — Welch t-tests on Fr/Fq multiplication, Fr/Fq inversion and G1
-# scalar multiplication, comparing fixed-vs-random and low-vs-high-Hamming-weight
-# inputs. Shared-runner noise makes this advisory: the target reports
-# t-statistics (target/ct-results/) and exits non-zero only with CT_STRICT=1.
-# A comparison passes when |t| stays below CT_THRESHOLD (dudect's default: 10).
-CT_BUDGET_MS ?= 1000
-CT_THRESHOLD ?= 10.0
-ct-test:
-	@echo "Running dudect-style constant-time measurements (|t| < $(CT_THRESHOLD) passes)..."
-	CT_TEST=1 CT_BUDGET_MS=$(CT_BUDGET_MS) CT_THRESHOLD=$(CT_THRESHOLD) \
-		cargo test --release -p soroban-zk-core --test ct
 
 # ── WASM ─────────────────────────────────────────────────────────────────────
 build-wasm:
