@@ -39,6 +39,15 @@ ark-bn254 = { version = "0.6.0", default-features = false, features = ["curve", 
 ark-ff = { version = "0.6.0", default-features = false, features = ["std"] }
 ark-ec = { version = "0.6.0", default-features = false, features = ["std"] }
 
+# Issue #689 — dudect-style constant-time statistics harness. A custom harness
+# (no libtest) so `make ct-test` runs the measurements directly. The binary is a
+# no-op unless CT_TEST=1, which keeps `cargo test --release` fast and
+# deterministic on shared runners.
+[[test]]
+name = "ct"
+path = "tests/ct/main.rs"
+harness = false
+
 [[bench]]
 name = "g1_ops"
 harness = false

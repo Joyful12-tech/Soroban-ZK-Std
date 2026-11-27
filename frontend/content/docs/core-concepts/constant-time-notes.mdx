@@ -221,6 +221,90 @@ As noted in Technique 2, the two fast-return checks at the top of `g1_scalar_mul
 
 ---
 
+## Measuring Constant-Time Behaviour: The dudect Harness
+
+Everything above is a *reasoned* argument: the code has no obvious data-dependent branches, so it should be constant-time. Issue **#689** adds a harness that *measures* the claim instead of trusting it.
+
+### How it works
+
+`crates/soroban-zk-core/tests/ct/` is a dev-only test target (`[[test]] name = "ct"`, `harness = false`). Each experiment runs the same operation on two classes of inputs and applies a dudect-style Welch t-test to the resulting timing samples:
+
+| Comparison | Class A | Class B |
+|-----------|---------|---------|
+| `fr_mul` / `fq_mul` | fixed operands | random operands |
+| `fr_mul` / `fq_mul` | operands with a single set bit (low Hamming weight) | uniform random operands (high Hamming weight) |
+| `fr_invert` / `fq_invert` | fixed input | random input |
+| `fr_invert` / `fq_invert` | low Hamming weight input | high Hamming weight input |
+| `g1_mul` | fixed scalar | random scalar |
+| `g1_mul` | two-bit scalar | uniform random scalar |
+
+Sampling choices follow the dudect paper:
+
+- Samples come from `RDTSC` on x86_64, serialised with `LFENCE`, or from `Instant` elsewhere, and time a **single** execution (never a loop average, which would hide per-input differences).
+- The two classes are interleaved inside one measurement loop, so frequency scaling and scheduler drift hit both equally.
+- Batch size adapts to the measured cost of the operation, so cheap multiplications and expensive scalar multiplications both yield several batches per budget.
+- The fastest and slowest 1% of every batch are cropped to reject interrupt outliers.
+- Welch's t-statistic is recomputed after each batch; the report keeps the largest absolute value seen, which is the conservative dudect verdict.
+
+### Running it
+
+```bash
+make ct-test                       # 10 comparisons, ~1 s of measurement each
+CT_BUDGET_MS=5000 make ct-test     # tighter confidence intervals
+CT_STRICT=1 make ct-test           # exit non-zero when a comparison leaks
+```
+
+The harness writes `target/ct-results/ct-report.json` and `ct-report.tsv` with the sample counts, median timings, per-batch final t and maximum t per comparison, so a run can be attached to a pull request and compared over time. `cargo test --release` does **not** run the measurements: the binary prints a skip notice unless `CT_TEST=1` is set, which keeps the default suite fast and deterministic. All knobs are environment variables (`CT_BUDGET_MS`, `CT_BATCH`, `CT_THRESHOLD`, `CT_SEED`, `CT_OUT_DIR`).
+
+### Threshold and interpretation
+
+The pass criterion is dudect's: `|t| < 10`.
+
+| t-statistic | Reading |
+|-------|---------|
+| below 4.5 | the two classes are practically indistinguishable |
+| 4.5 to 10 | suspicious; re-run with `CT_BUDGET_MS=5000` before drawing conclusions |
+| above 10 | the timing distributions separate; the operation leaks information about the input class |
+
+A large `|t|` is a signal to investigate, not a proof of exploitability: the measured difference must still be reachable by an attacker with the assumed timing granularity. Note also that `g1_mul` timings include the affine conversion (`invert_fq`) because the harness exercises the public `G1Affine::scalar_mul` path.
+
+### Limitations
+
+The measurements run on shared CI runners, so scheduler preemption, frequency scaling, SMT neighbours and cache pressure add noise. Interleaving, 1% cropping and large sample counts mitigate this but cannot remove it:
+
+- A clean operation can occasionally report `|t| > 4.5` on a noisy shared runner; re-run before drawing conclusions.
+- A leak whose timing difference is smaller than the timer resolution stays below the threshold.
+- `RDTSC` counts cycles, not instructions, so numbers from different CPU generations or turbo states are not directly comparable.
+- Fixed-vs-random comparisons also react to branch-predictor and cache *history*: a fixed input is perfectly predictable by construction, so part of a large `|t|` there reflects the harness rather than a value-dependent branch. The low-vs-high-Hamming-weight comparisons are the more direct signal for secret-dependent work.
+- Only the chosen input classes are covered. A leak that needs a different class (for example points at infinity, or a specific bit pattern) is not seen.
+
+For these reasons the `ct-timing` job in `.github/workflows/ci.yml` is **non-blocking**: it runs `make ct-test`, uploads the t-statistics as the `ct-t-statistics` artifact and never blocks a pull request. Promote it to a blocking gate only after runner noise has been characterised.
+
+### Reading an example run
+
+One run on an x86_64 Linux VM (a cloud sandbox, not a dedicated timing rig) with the default 1000 ms budget (`clock=rdtsc`) reported medians in CPU cycles:
+
+| Comparison | n per class | median A | median B | max t | verdict |
+|-----------|-------------|----------|----------|-------|---------|
+| `fr_mul` fixed vs random | ~339k | 560 | 562 | 15.6 | suspicious |
+| `fr_mul` low vs high HW | ~339k | 578 | 566 | 11.9 | suspicious |
+| `fq_mul` fixed vs random | ~337k | 586 | 598 | 33.1 | suspicious |
+| `fq_mul` low vs high HW | ~337k | 600 | 598 | 10.4 | suspicious |
+| `fr_invert` fixed vs random | ~6.6k | 224k | 224k | 1.6 | pass |
+| `fr_invert` low vs high HW | ~6.9k | 223k | 222k | 1.0 | pass |
+| `fq_invert` fixed vs random | ~7.4k | 215k | 215k | 2.2 | pass |
+| `fq_invert` low vs high HW | ~7.3k | 215k | 215k | 0.8 | pass |
+| `g1_mul` fixed vs random | ~430 | 4.0M | 4.0M | 0.7 | pass |
+| `g1_mul` low vs high HW | ~560 | 3.0M | 4.0M | 26.7 | suspicious |
+
+Three observations follow, and all match the limitations documented above:
+
+- **Multiplication separates measurably.** `montgomery_mul` propagates carries with data-dependent `while c > 0` loops and finishes with a `while limbs5_ge(...)` conditional subtraction, and `mul_mod` reduces both operands with `%`. Those costs depend on the operand values, so the two classes separate well above the threshold. This is the concrete measurement behind the "variable multiplication cost" limitation; a fixed-iteration carry chain and a masked final subtraction would close it. The sign of the difference is not stable across machines, only its presence.
+- **Scalar multiplication leaks on sparse scalars.** A scalar whose highest set bit is far below bit 253 leaves the accumulator at the identity for many doublings, so `double`/`add` take the documented identity fast paths; the measured medians differ by about 25% (3.0M vs 4.0M cycles). Uniformly random scalars almost always have their top bit near 253, which is why fixed-vs-random passes while low-vs-high Hamming weight does not. Closing this needs a complete addition formula rather than the identity fast paths.
+- **Fermat inversion is flat.** The fixed public exponent dominates the cost, and the measured class difference is within noise, as the technique section predicts.
+
+Treat the numbers as a property of the machine as much as of the code: re-run `make ct-test` on the hardware you care about before quoting any of them, and expect the absolute `|t|` values to differ between runs.
+
 ## References
 
 - [Bernstein, D.J. — Timing attacks](https://cr.yp.to/antiforgery/cachetiming-20050414.pdf)
